@@ -1,37 +1,33 @@
+# app/routers/analyze.py  (study / sanitized version)
 import os
 import re
 from typing import List, Dict, Any, Optional, Set, Tuple
-
-from datetime import datetime, timedelta  # ✅ timezone 제거
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, Query, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
-from app.db import get_db  # dashboard.py 와 동일한 DB 세션 사용
+from app.db import get_db  # 기존과 동일 세션
 
-print(">>> loaded routers.analyze (MySQL version):", __file__, flush=True)
+print(">>> loaded routers.analyze (MySQL study version):", __file__, flush=True)
 
-# /api/analyze 로 분리
 router = APIRouter(prefix="/api/analyze", tags=["analyze"])
 
 # ---- Debug toggle ----
 DEBUG = os.getenv("ANALYZE_DEBUG", "0").lower() in ("1", "true", "yes", "on")
-
-
 def dlog(*args: Any) -> None:
     if DEBUG:
         print(*args, flush=True)
 
-
 # ---- MySQL env ----
-DEVICE_TABLE = os.getenv("DEVICE_KPI_TABLE", "device_kpi")
+SIGNAL_TABLE = os.getenv("SIGNAL_TABLE", "signal_log")
 
 
-def _validate_workcell(workcell: str) -> str:
-    if not re.fullmatch(r"[A-Za-z0-9_\-]+", workcell or ""):
-        raise HTTPException(status_code=400, detail="Invalid workcell")
-    return workcell
+def _validate_site(site: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+", site or ""):
+        raise HTTPException(status_code=400, detail="Invalid site")
+    return site
 
 
 # ---------------- Range → window 매핑 ----------------
@@ -45,15 +41,12 @@ def _window_for_range(range_str: str) -> timedelta:
     그 외 값은 기본 30분으로 처리
     """
     key = (range_str or "").strip().lower()
-
     if key == "30m":
         return timedelta(minutes=30)
     if key == "1day":
         return timedelta(days=1)
     if key == "7day":
         return timedelta(days=7)
-
-    # 알 수 없는 값이면 안전하게 30분
     return timedelta(minutes=30)
 
 
@@ -63,200 +56,134 @@ def _fetch_all(db: Session, sql: str, params: Dict[str, Any]) -> List[Dict[str, 
     rows = db.execute(text(sql), params).mappings().all()
     return [dict(r) for r in rows]
 
-
-# ------------------------------------------------------------------------
-# GET /api/analyze/device_types  → {"types":[...]}
-#   - MySQL device_kpi 에서 DISTINCT device_type
-# ------------------------------------------------------------------------
-@router.get("/device_types")
-def list_device_types(
-    workcell: str = Query(..., description="워크셀 ID (예: A1)"),
+@router.get("/component_types")
+def list_component_types(
+    site: str = Query(..., description="사이트/라인 ID (예: A1)"),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    workcell = _validate_workcell(workcell)
+    site = _validate_site(site)
 
     sql = f"""
-        SELECT DISTINCT device_type
-        FROM {DEVICE_TABLE}
-        WHERE workcell = :workcell
-          AND device_type IS NOT NULL
-          AND device_type <> ''
-        ORDER BY device_type
+        SELECT DISTINCT component
+        FROM {SIGNAL_TABLE}
+        WHERE site_id = :site
+          AND component IS NOT NULL
+          AND component <> ''
+        ORDER BY component
     """
-    rows = _fetch_all(db, sql, {"workcell": workcell})
-    types: List[str] = [str(r["device_type"]) for r in rows if r.get("device_type")]
+    rows = _fetch_all(db, sql, {"site": site})
+    types: List[str] = [str(r["component"]) for r in rows if r.get("component")]
 
-    dlog("[/api/analyze/device_types] count:", len(types), "types:", types)
-    return {
-        "types": types,
-        "_source": "mysql",
-        "_table": DEVICE_TABLE,
-        "_workcell": workcell,
-    }
+    dlog("[/api/analyze/component_types] count:", len(types), "types:", types)
+    return {"types": types, "_source": "mysql", "_table": SIGNAL_TABLE, "_site": site}
 
 
-# ------------------------------------------------------------------------
-# GET /api/analyze/device_names  → {"devices":[...]}
-#   - 옵션: device_type 로 필터
-# ------------------------------------------------------------------------
-@router.get("/device_names")
-def list_device_names(
-    workcell: str = Query(..., description="워크셀 ID (예: A1)"),
-    device_type: Optional[str] = Query(
-        None,
-        description="필터: 특정 device_type 만",
-    ),
+@router.get("/node_names")
+def list_node_names(
+    site: str = Query(..., description="사이트/라인 ID (예: A1)"),
+    component: Optional[str] = Query(None, description="필터: 특정 component 만"),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    workcell = _validate_workcell(workcell)
+    site = _validate_site(site)
 
     base_sql = f"""
-        SELECT DISTINCT device_name
-        FROM {DEVICE_TABLE}
-        WHERE workcell = :workcell
-          AND device_name IS NOT NULL
-          AND device_name <> ''
+        SELECT DISTINCT node_name
+        FROM {SIGNAL_TABLE}
+        WHERE site_id = :site
+          AND node_name IS NOT NULL
+          AND node_name <> ''
     """
-    params: Dict[str, Any] = {"workcell": workcell}
+    params: Dict[str, Any] = {"site": site}
 
-    if device_type:
-        base_sql += " AND device_type = :device_type"
-        params["device_type"] = device_type
+    if component:
+        base_sql += " AND component = :component"
+        params["component"] = component
 
-    base_sql += " ORDER BY device_name"
+    base_sql += " ORDER BY node_name"
 
     rows = _fetch_all(db, base_sql, params)
-    names: List[str] = [str(r["device_name"]) for r in rows if r.get("device_name")]
+    names: List[str] = [str(r["node_name"]) for r in rows if r.get("node_name")]
 
     dlog(
-        "[/api/analyze/device_names] count:",
-        len(names),
-        "workcell:",
-        workcell,
-        "device_type:",
-        device_type or "(none)",
-        "names:",
-        names,
+        "[/api/analyze/node_names] count:", len(names),
+        "site:", site, "component:", component or "(none)"
     )
-
-    return {
-        "devices": names,
-        "_source": "mysql",
-        "_table": DEVICE_TABLE,
-        "_workcell": workcell,
-        "_device_type": device_type,
-    }
+    return {"nodes": names, "_source": "mysql", "_table": SIGNAL_TABLE, "_site": site, "_component": component}
 
 
-# ------------------------------------------------------------------------
-# GET /api/analyze/devices
-#   → {"devices":[{"device_type": "...", "device_name": "..."}, ...]}
-#   - type / name 둘 다 한 번에 받고 싶을 때 사용
-# ------------------------------------------------------------------------
-@router.get("/devices")
-def list_devices(
-    workcell: str = Query(..., description="워크셀 ID (예: A1)"),
+@router.get("/nodes")
+def list_nodes(
+    site: str = Query(..., description="사이트/라인 ID (예: A1)"),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    workcell = _validate_workcell(workcell)
+    site = _validate_site(site)
 
     sql = f"""
-        SELECT DISTINCT device_type, device_name
-        FROM {DEVICE_TABLE}
-        WHERE workcell = :workcell
-          AND device_name IS NOT NULL
-          AND device_name <> ''
-          AND device_type IS NOT NULL
-          AND device_type <> ''
-        ORDER BY device_type, device_name
+        SELECT DISTINCT component, node_name
+        FROM {SIGNAL_TABLE}
+        WHERE site_id = :site
+          AND node_name IS NOT NULL AND node_name <> ''
+          AND component IS NOT NULL AND component <> ''
+        ORDER BY component, node_name
     """
-    rows = _fetch_all(db, sql, {"workcell": workcell})
+    rows = _fetch_all(db, sql, {"site": site})
 
-    devices: List[Dict[str, str]] = []
+    nodes: List[Dict[str, str]] = []
     seen: Set[Tuple[str, str]] = set()
-
     for r in rows:
-        t = str(r.get("device_type") or "")
-        n = str(r.get("device_name") or "")
-        if not t or not n:
+        c = str(r.get("component") or "").strip()
+        n = str(r.get("node_name") or "").strip()
+        if not c or not n:
             continue
-
-        key = (t, n)
+        key = (c, n)
         if key in seen:
             continue
         seen.add(key)
+        nodes.append({"component": c, "node_name": n})
 
-        devices.append({"device_type": t, "device_name": n})
-
-    dlog("[/api/analyze/devices] count:", len(devices), "devices:", devices)
-
-    return {
-        "devices": devices,
-        "_source": "mysql",
-        "_table": DEVICE_TABLE,
-        "_workcell": workcell,
-    }
+    dlog("[/api/analyze/nodes] count:", len(nodes))
+    return {"nodes": nodes, "_source": "mysql", "_table": SIGNAL_TABLE, "_site": site}
 
 
-# ------------------------------------------------------------------------
-# GET /api/analyze/timeseries
-# ------------------------------------------------------------------------
 @router.get("/timeseries")
 def timeseries(
-    workcell: str = Query(..., description="워크셀 ID (예: A1)"),
+    site: str = Query(..., description="사이트/라인 ID (예: A1)"),
     metric: str = Query(
-        "defect_rate",
-        description='metric: "defect_rate" 또는 "cycle" (cycle time)',
+        "quality_pct",
+        description='metric: "quality_pct"(정상품질%) 또는 "latency"(지연/사이클)',
     ),
-    range: str = Query(
-        "30m",
-        alias="range",
-        description='"30m", "1day", "7day" 중 하나',
-    ),
-    device_types: Optional[str] = Query(
-        None,
-        description="쉼표로 구분된 device_type 목록 (예: Conveyor,Robot)",
-    ),
-    device_names: Optional[str] = Query(
-        None,
-        description="쉼표로 구분된 device_name 목록 (예: X_Robot,Y_Robot)",
-    ),
+    range: str = Query("30m", alias="range", description='"30m", "1day", "7day" 중 하나'),
+    component_types: Optional[str] = Query(None, description="쉼표로 구분된 component 목록 (예: Conveyor,Robot)"),
+    node_names: Optional[str] = Query(None, description="쉼표로 구분된 node_name 목록"),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    import traceback  # 내부 디버깅용
+    import traceback
 
     try:
-        workcell = _validate_workcell(workcell)
+        site = _validate_site(site)
 
-        metric_norm = metric.strip().lower()
-        if metric_norm not in ("defect_rate", "cycle"):
-            raise HTTPException(
-                status_code=400,
-                detail="metric must be 'defect_rate' or 'cycle'",
-            )
+        metric_norm = (metric or "").strip().lower()
+        if metric_norm not in ("quality_pct", "latency"):
+            raise HTTPException(status_code=400, detail="metric must be 'quality_pct' or 'latency'")
 
-        # ----- 1) 앵커 시간: 이 워크셀의 최신 time (DB 기준) -----
+        # ----- 1) 앵커 시간: 이 site의 최신 logged_at -----
         anchor_sql = f"""
-            SELECT MAX(time) AS max_time
-            FROM {DEVICE_TABLE}
-            WHERE workcell = :workcell
+            SELECT MAX(logged_at) AS max_time
+            FROM {SIGNAL_TABLE}
+            WHERE site_id = :site
         """
-        anchor_rows = _fetch_all(db, anchor_sql, {"workcell": workcell})
-        anchor_time = (
-            anchor_rows[0]["max_time"]
-            if anchor_rows and anchor_rows[0].get("max_time") is not None
-            else None
-        )
+        anchor_rows = _fetch_all(db, anchor_sql, {"site": site})
+        anchor_time = anchor_rows[0].get("max_time") if anchor_rows else None
 
         if anchor_time is None:
-            dlog("[/api/analyze/timeseries] no data for workcell:", workcell)
+            dlog("[/api/analyze/timeseries] no data for site:", site)
             return {
-                "workcell": workcell,
+                "site": site,
                 "metric": metric_norm,
                 "range": range,
                 "series": [],
                 "_source": "mysql",
-                "_table": DEVICE_TABLE,
+                "_table": SIGNAL_TABLE,
                 "anchor_time": None,
                 "t_from": None,
                 "t_to": None,
@@ -268,194 +195,137 @@ def timeseries(
             except Exception:
                 dlog("[/api/analyze/timeseries] anchor_time not datetime:", anchor_time)
 
-        # ----- 2) 시간 구간: 앵커 기준, range 에 따라 동적 -----
+        # ----- 2) 시간 구간: 앵커 기준 -----
         window = _window_for_range(range)
         t_to = anchor_time
         t_from = anchor_time - window
 
-        dlog(
-            "[/api/analyze/timeseries] anchor_time:",
-            anchor_time,
-            "window:",
-            window,
-            "t_from:",
-            t_from,
-            "t_to:",
-            t_to,
-            "range_param:",
-            range,
-        )
+        # ----- 3) 필터 파라미터 파싱 -----
+        sel_components: Optional[List[str]] = None
+        sel_nodes: Optional[List[str]] = None
 
-        # ----- 3) 필터 파라미터 파싱 (쉼표 구분) -----
-        sel_types: Optional[List[str]] = None
-        sel_names: Optional[List[str]] = None
+        if component_types:
+            sel_components = [s.strip() for s in component_types.split(",") if s.strip()]
+        if node_names:
+            sel_nodes = [s.strip() for s in node_names.split(",") if s.strip()]
 
-        if device_types:
-            sel_types = [s.strip() for s in device_types.split(",") if s.strip()]
-        if device_names:
-            sel_names = [s.strip() for s in device_names.split(",") if s.strip()]
+        # 타입이 하나라도 선택되면 type 시리즈는 항상 만든다
+        want_component_series = bool(sel_components)
+        # 노드 시리즈는 항상 만든다(선택 없으면 전체)
+        want_node_series = True
 
-        dlog(
-            "[/api/analyze/timeseries] filters:",
-            "types =", sel_types or [],
-            "names =", sel_names or [],
-        )
-
-        # ✅ 타입이 하나라도 선택되면 type 시리즈는 항상 만든다
-        want_type_series = bool(sel_types)
-        # ✅ 디바이스는 name 선택 여부와 관계없이, sel_names가 없으면 전체
-        want_device_series = True
-
-        # ----- 4) SQL 구성 -----
-        # 🔹 device_kpi 스키마 기준:
-        #   ct           → cycle_time_s
-        #   `count`      → total_count
-        #   defect_count → defect_count
+        # ----- 4) SQL 구성 (✅ 테이블/컬럼명 변경 + 컬럼 1개 추가(batch_id)) -----
         sql = f"""
             SELECT
-                time,
-                device_type,
-                device_name,
-                ct AS cycle_time_s,
-                `count` AS total_count,
-                defect_count
-            FROM {DEVICE_TABLE}
-            WHERE workcell = :workcell
-              AND time >= :t_from
-              AND time <= :t_to
-              AND device_type IS NOT NULL
-              AND device_type <> ''
-              AND device_name IS NOT NULL
-              AND device_name <> ''
+                logged_at,
+                component,
+                node_name,
+                latency_s,
+                sample_total,
+                sample_bad,
+                batch_id
+            FROM {SIGNAL_TABLE}
+            WHERE site_id = :site
+              AND logged_at >= :t_from
+              AND logged_at <= :t_to
+              AND component IS NOT NULL AND component <> ''
+              AND node_name IS NOT NULL AND node_name <> ''
         """
-        params: Dict[str, Any] = {
-            "workcell": workcell,
-            "t_from": t_from,
-            "t_to": t_to,
-        }
+        params: Dict[str, Any] = {"site": site, "t_from": t_from, "t_to": t_to}
 
-        # IN (...) placeholder 확장
-        if sel_types:
-            type_ph = []
-            for i, tval in enumerate(sel_types):
-                key = f"type_{i}"
-                type_ph.append(f":{key}")
-                params[key] = tval
-            sql += f" AND device_type IN ({', '.join(type_ph)})"
+        if sel_components:
+            ph = []
+            for i, v in enumerate(sel_components):
+                k = f"comp_{i}"
+                ph.append(f":{k}")
+                params[k] = v
+            sql += f" AND component IN ({', '.join(ph)})"
 
-        if sel_names:
-            name_ph = []
-            for i, nval in enumerate(sel_names):
-                key = f"name_{i}"
-                name_ph.append(f":{key}")
-                params[key] = nval
-            sql += f" AND device_name IN ({', '.join(name_ph)})"
+        if sel_nodes:
+            ph = []
+            for i, v in enumerate(sel_nodes):
+                k = f"node_{i}"
+                ph.append(f":{k}")
+                params[k] = v
+            sql += f" AND node_name IN ({', '.join(ph)})"
 
-        sql += " ORDER BY time ASC"
+        sql += " ORDER BY logged_at ASC"
 
         rows = _fetch_all(db, sql, params)
         dlog("[/api/analyze/timeseries] raw row count:", len(rows))
 
-        # 장비별 로우 카운트 로그
-        per_key: Dict[str, int] = {}
-        for r in rows:
-            dtp = str(r.get("device_type") or "").strip()
-            dnm = str(r.get("device_name") or "").strip()
-            key = f"{dtp}::{dnm}"
-            per_key[key] = per_key.get(key, 0) + 1
-        dlog("[/api/analyze/timeseries] row count by device:", per_key)
-
         # ----- 5) 시리즈 집계 구조 -----
         series_map: Dict[str, Dict[str, Any]] = {}
 
-        def _ensure_series(
-            key: str,
-            kind: str,
-            device_type: str,
-            device_name: Optional[str],
-        ) -> Dict[str, Any]:
+        def _ensure_series(key: str, kind: str, component: str, node_name: Optional[str]) -> Dict[str, Any]:
             if key not in series_map:
                 series_map[key] = {
                     "key": key,
-                    "kind": kind,  # "type" or "device"
-                    "device_type": device_type,
-                    "device_name": device_name,
+                    "kind": kind,  # "component" or "node"
+                    "component": component,
+                    "node_name": node_name,
                     "time": [],
                     "values": [],
-                    "_agg": {},  # t_iso -> {sum, cnt, sum_count, sum_def}
+                    "_agg": {},  # t_iso -> {sum_lat, cnt_lat, sum_total, sum_bad}
                 }
             return series_map[key]
 
         for r in rows:
-            t_raw = r.get("time")
+            t_raw = r.get("logged_at")
             if t_raw is None:
                 continue
+            t_iso = t_raw.isoformat() if isinstance(t_raw, datetime) else str(t_raw)
 
-            if isinstance(t_raw, datetime):
-                t_iso = t_raw.isoformat()
-            else:
-                t_iso = str(t_raw)
-
-            dtp = str(r.get("device_type") or "").strip()
-            dnm = str(r.get("device_name") or "").strip()
-            if not dtp or not dnm:
+            comp = str(r.get("component") or "").strip()
+            node = str(r.get("node_name") or "").strip()
+            if not comp or not node:
                 continue
 
-            cycle_val = r.get("cycle_time_s")
-            total_cnt = r.get("total_count")
-            defect_cnt = r.get("defect_count")
+            latency_val = r.get("latency_s")
+            total_cnt = r.get("sample_total")
+            bad_cnt = r.get("sample_bad")
 
-            # ----- device_name 시리즈 -----
-            if want_device_series:
-                if (not sel_names) or (dnm in sel_names):
-                    dev_key = f"device:{dnm}"
-                    dev_ser = _ensure_series(dev_key, "device", dtp, dnm)
-                    ag = dev_ser["_agg"].setdefault(
-                        t_iso,
-                        {"sum": 0.0, "cnt": 0, "sum_count": 0.0, "sum_def": 0.0},
-                    )
+            # ----- node 시리즈 -----
+            if want_node_series:
+                if (not sel_nodes) or (node in sel_nodes):
+                    dev_key = f"node:{node}"
+                    ser = _ensure_series(dev_key, "node", comp, node)
+                    ag = ser["_agg"].setdefault(t_iso, {"sum_lat": 0.0, "cnt_lat": 0, "sum_total": 0.0, "sum_bad": 0.0})
 
-                    if metric_norm == "cycle":
-                        if cycle_val is not None:
-                            ag["sum"] += float(cycle_val)
-                            ag["cnt"] += 1
-
-                    elif metric_norm == "defect_rate":
-                        if total_cnt is not None and defect_cnt is not None:
+                    if metric_norm == "latency":
+                        if latency_val is not None:
+                            ag["sum_lat"] += float(latency_val)
+                            ag["cnt_lat"] += 1
+                    else:  # quality_pct
+                        if total_cnt is not None and bad_cnt is not None:
                             try:
                                 c = float(total_cnt)
-                                d = float(defect_cnt)
+                                b = float(bad_cnt)
                             except (TypeError, ValueError):
-                                c = 0.0
-                                d = 0.0
-                            ag["sum_count"] += c
-                            ag["sum_def"] += d
+                                c, b = 0.0, 0.0
+                            ag["sum_total"] += c
+                            ag["sum_bad"] += b
 
-            # ----- device_type 시리즈 (상위 집계) -----
-            if want_type_series:
-                if (not sel_types) or (dtp in sel_types):
-                    type_key = f"type:{dtp}"
-                    type_ser = _ensure_series(type_key, "type", dtp, None)
-                    ag_t = type_ser["_agg"].setdefault(
-                        t_iso,
-                        {"sum": 0.0, "cnt": 0, "sum_count": 0.0, "sum_def": 0.0},
-                    )
+            # ----- component 시리즈(상위 집계) -----
+            if want_component_series:
+                if (not sel_components) or (comp in sel_components):
+                    type_key = f"component:{comp}"
+                    ser = _ensure_series(type_key, "component", comp, None)
+                    ag = ser["_agg"].setdefault(t_iso, {"sum_lat": 0.0, "cnt_lat": 0, "sum_total": 0.0, "sum_bad": 0.0})
 
-                    if metric_norm == "cycle":
-                        if cycle_val is not None:
-                            ag_t["sum"] += float(cycle_val)
-                            ag_t["cnt"] += 1
-
-                    elif metric_norm == "defect_rate":
-                        if total_cnt is not None and defect_cnt is not None:
+                    if metric_norm == "latency":
+                        if latency_val is not None:
+                            ag["sum_lat"] += float(latency_val)
+                            ag["cnt_lat"] += 1
+                    else:
+                        if total_cnt is not None and bad_cnt is not None:
                             try:
                                 c = float(total_cnt)
-                                d = float(defect_cnt)
+                                b = float(bad_cnt)
                             except (TypeError, ValueError):
-                                c = 0.0
-                                d = 0.0
-                            ag_t["sum_count"] += c
-                            ag_t["sum_def"] += d
+                                c, b = 0.0, 0.0
+                            ag["sum_total"] += c
+                            ag["sum_bad"] += b
 
         # ----- 6) agg → time / values 배열로 변환 -----
         result_series: List[Dict[str, Any]] = []
@@ -464,79 +334,42 @@ def timeseries(
             agg = ser.pop("_agg", {})
             keys_sorted = sorted(agg.keys())
 
-            time_list: List[str] = []
-            val_list: List[Optional[float]] = []
+            t_list: List[str] = []
+            v_list: List[Optional[float]] = []
 
             for t_iso in keys_sorted:
                 info = agg[t_iso]
-                if metric_norm == "cycle":
-                    if info["cnt"] > 0:
-                        # 합을 그대로 사용 (원하면 평균 info["sum"]/info["cnt"] 로 변경 가능)
-                        value = info["sum"]
+                if metric_norm == "latency":
+                    value = (info["sum_lat"] / info["cnt_lat"]) if info["cnt_lat"] > 0 else None
+                else:  # quality_pct
+                    if info["sum_total"] > 0:
+                        value = (info["sum_total"] - info["sum_bad"]) * 100.0 / info["sum_total"]
                     else:
                         value = None
-                elif metric_norm == "defect_rate":
-                    if info["sum_count"] > 0:
-                        # good ratio %
-                        good_ratio_pct = (
-                            (info["sum_count"] - info["sum_def"])
-                            * 100.0
-                            / info["sum_count"]
-                        )
-                        value = good_ratio_pct
-                    else:
-                        value = None
-                else:
-                    value = None
 
-                time_list.append(t_iso)
-                val_list.append(value)
+                t_list.append(t_iso)
+                v_list.append(value)
 
-            ser["time"] = time_list
-            ser["values"] = val_list
+            ser["time"] = t_list
+            ser["values"] = v_list
             result_series.append(ser)
 
-            dlog(
-                "[/api/analyze/timeseries] series built:",
-                key,
-                "points:",
-                len(time_list),
-            )
-
-        dlog(
-            "[/api/analyze/timeseries] series count:",
-            len(result_series),
-            "workcell:",
-            workcell,
-            "metric:",
-            metric_norm,
-            "range(param):",
-            range,
-        )
+            dlog("[/api/analyze/timeseries] series built:", key, "points:", len(t_list))
 
         return {
-            "workcell": workcell,
+            "site": site,
             "metric": metric_norm,
             "range": range,
             "series": result_series,
             "_source": "mysql",
-            "_table": DEVICE_TABLE,
-            "anchor_time": anchor_time.isoformat()
-            if isinstance(anchor_time, datetime)
-            else str(anchor_time),
-            "t_from": t_from.isoformat()
-            if isinstance(t_from, datetime)
-            else str(t_from),
-            "t_to": t_to.isoformat()
-            if isinstance(t_to, datetime)
-            else str(t_to),
+            "_table": SIGNAL_TABLE,
+            "anchor_time": anchor_time.isoformat() if isinstance(anchor_time, datetime) else str(anchor_time),
+            "t_from": t_from.isoformat() if isinstance(t_from, datetime) else str(t_from),
+            "t_to": t_to.isoformat() if isinstance(t_to, datetime) else str(t_to),
         }
 
     except HTTPException:
         raise
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"timeseries internal error: {e}",
-        )
+        raise HTTPException(status_code=500, detail=f"timeseries internal error: {e}")

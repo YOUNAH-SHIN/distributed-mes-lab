@@ -11,7 +11,6 @@ from sqlalchemy import text
 from ..db import get_db
 from ..auth import get_current_user  # 세션/로그인 재사용
 
-# 👇 여기서 prefix를 "/api/alerts" 로 고정
 router = APIRouter(prefix="/api/alerts", tags=["alerts"])
 
 
@@ -31,46 +30,51 @@ def _iso(v: Optional[datetime]) -> Optional[str]:
 
 
 def _display_name(
-  name: Optional[str],
-  login_id: Optional[str],
+  display_name: Optional[str],
+  username: Optional[str],
   email: Optional[str],
 ) -> Optional[str]:
   """
   표시용 이름:
-  1) name 컬럼이 있으면 제일 먼저 사용
-  2) 없으면 login_id
+  1) display_name 컬럼이 있으면 제일 먼저 사용
+  2) 없으면 username
   3) 그것도 없으면 email
   """
-  return name or login_id or email or None
+  return display_name or username or email or None
 
 
-# =========================
-# Pydantic Schemas
-# =========================
+def _to_float(v: Any) -> float:
+  try:
+    if v is None:
+      return 0.0
+    return float(v)
+  except Exception:
+    return 0.0
+
 
 class AlertItem(BaseModel):
   id: int
 
-  workcell_code: str
-  device_name: Optional[str] = None
+  cell_id: str
+  asset_name: Optional[str] = None
 
-  category: str
-  param_code: str
-  severity: str
-  status: str
+  alert_type: str
+  metric_key: str
+  level: str
+  state: str
 
-  description: str
+  message: str
 
-  threshold_value: float
-  actual_value: float
-  unit: Optional[str] = None
+  threshold: float
+  observed: float
+  uom: Optional[str] = None
 
-  event_time: str
-  acknowledged_at: Optional[str] = None
-  resolved_at: Optional[str] = None
+  occurred_at: str
+  acked_at: Optional[str] = None
+  closed_at: Optional[str] = None
 
-  acknowledged_by: Optional[str] = None
-  resolved_by: Optional[str] = None
+  acked_by: Optional[str] = None
+  closed_by: Optional[str] = None
 
   created_at: Optional[str] = None
   updated_at: Optional[str] = None
@@ -85,13 +89,14 @@ class AlertsListResp(BaseModel):
 # GET /api/alerts
 # =========================
 #
-# - 기본: status in ('active','acknowledged')  (open)
-# - ?status=all       -> 전체
-# - ?status=resolved  -> resolved 만
-# - ?status=inactive  -> inactive 만
+# - 기본: state in ('open','ack')  (open)
+# - ?status=all     -> 전체
+# - ?status=closed  -> closed 만
+# - ?status=muted   -> muted 만
+# - ?status=open    -> open+ack (기본)
 # =========================
 
-@router.get("", response_model=AlertsListResp)  # 👈 "" → prefix 뒤에 그대로 붙음
+@router.get("", response_model=AlertsListResp)
 def list_alerts(
   request: Request,
   response: Response,
@@ -99,7 +104,7 @@ def list_alerts(
   current_user: Dict[str, Any] = Depends(get_current_user),
   status: Optional[str] = Query(
     default="open",
-    description="open(기본: active+acknowledged) | all | active | acknowledged | resolved | inactive",
+    description="open(기본: open+ack) | all | open | ack | closed | muted",
   ),
   limit: int = Query(default=100, ge=1, le=500),
 ):
@@ -121,53 +126,51 @@ def list_alerts(
   params: Dict[str, Any] = {"limit": limit}
 
   if status == "open" or status is None:
-    where_clauses.append("a.status IN ('active', 'acknowledged')")
+    where_clauses.append("e.state IN ('open', 'ack')")
   elif status == "all":
-    # no filter
     pass
   else:
-    where_clauses.append("a.status = :status")
+    where_clauses.append("e.state = :status")
     params["status"] = status
 
   where_sql = ""
   if where_clauses:
     where_sql = "WHERE " + " AND ".join(where_clauses)
 
-  # ---- 쿼리 ----
   q = text(f"""
     SELECT
-      a.id,
-      a.workcell_code,
-      a.device_name,
-      a.category,
-      a.param_code,
-      a.severity,
-      a.status,
-      a.description,
-      a.threshold_value,
-      a.actual_value,
-      a.unit,
-      a.event_time,
-      a.acknowledged_at,
-      a.resolved_at,
-      a.created_at,
-      a.updated_at,
+      e.id,
+      e.cell_id,
+      e.asset_name,
+      e.alert_type,
+      e.metric_key,
+      e.level,
+      e.state,
+      e.message,
+      e.threshold,
+      e.observed,
+      e.uom,
+      e.occurred_at,
+      e.acked_at,
+      e.closed_at,
+      e.created_at,
+      e.updated_at,
 
       -- Acknowledged by
-      ma.name     AS ack_name,
-      ma.login_id AS ack_login_id,
-      ma.email    AS ack_email,
+      ua.display_name AS ack_display_name,
+      ua.username     AS ack_username,
+      ua.email        AS ack_email,
 
-      -- Resolved by
-      mr.name     AS res_name,
-      mr.login_id AS res_login_id,
-      mr.email    AS res_email
+      -- Closed by
+      uc.display_name AS close_display_name,
+      uc.username     AS close_username,
+      uc.email        AS close_email
 
-    FROM alerts a
-    LEFT JOIN members ma ON ma.id = a.acknowledged_by
-    LEFT JOIN members mr ON mr.id = a.resolved_by
+    FROM event_alerts e
+    LEFT JOIN users ua ON ua.id = e.ack_user_id
+    LEFT JOIN users uc ON uc.id = e.close_user_id
     {where_sql}
-    ORDER BY a.event_time DESC
+    ORDER BY e.occurred_at DESC
     LIMIT :limit
   """)
 
@@ -182,33 +185,33 @@ def list_alerts(
     items.append(
       AlertItem(
         id=row["id"],
-        workcell_code=row["workcell_code"],
-        device_name=row.get("device_name"),
+        cell_id=row["cell_id"],
+        asset_name=row.get("asset_name"),
 
-        category=row["category"],
-        param_code=row["param_code"],
-        severity=row["severity"],
-        status=row["status"],
+        alert_type=row["alert_type"],
+        metric_key=row["metric_key"],
+        level=row["level"],
+        state=row["state"],
 
-        description=row["description"],
+        message=row["message"],
 
-        threshold_value=float(row["threshold_value"]),
-        actual_value=float(row["actual_value"]),
-        unit=row.get("unit"),
+        threshold=_to_float(row.get("threshold")),
+        observed=_to_float(row.get("observed")),
+        uom=row.get("uom"),
 
-        event_time=_iso(row.get("event_time")) or "",
-        acknowledged_at=_iso(row.get("acknowledged_at")),
-        resolved_at=_iso(row.get("resolved_at")),
+        occurred_at=_iso(row.get("occurred_at")) or "",
+        acked_at=_iso(row.get("acked_at")),
+        closed_at=_iso(row.get("closed_at")),
 
-        acknowledged_by=_display_name(
-          row.get("ack_name"),
-          row.get("ack_login_id"),
+        acked_by=_display_name(
+          row.get("ack_display_name"),
+          row.get("ack_username"),
           row.get("ack_email"),
         ),
-        resolved_by=_display_name(
-          row.get("res_name"),
-          row.get("res_login_id"),
-          row.get("res_email"),
+        closed_by=_display_name(
+          row.get("close_display_name"),
+          row.get("close_username"),
+          row.get("close_email"),
         ),
 
         created_at=_iso(row.get("created_at")),
